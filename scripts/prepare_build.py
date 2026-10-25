@@ -90,6 +90,7 @@ def wake_entries(old):
             tokens={line.rsplit(" ",1)[0] for line in (ASSETS/"wake/tokens.txt").read_text().splitlines()}
             if not all(piece in tokens for piece in pieces):raise RuntimeError("Wake token mismatch")
             (ASSETS/"keywords.txt").write_text(" ".join(pieces)+" @HEY_ULTRON\n")
+    return result
 
 def main():
     ASSETS.mkdir(parents=True,exist_ok=True)
