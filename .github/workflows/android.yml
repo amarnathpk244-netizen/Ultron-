@@ -1,0 +1,81 @@
+name: Build ULTRON Android
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["app/**", "scripts/**", "*.kts", "gradle.properties", ".github/workflows/**"]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ultron-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+      - name: Install Android toolchain
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.1.13356709" "cmake;3.22.1"
+      - name: Prepare native sources and model hashes
+        run: |
+          python -m pip install sentencepiece==0.2.0
+          python scripts/prepare_build.py
+      - name: Dependency-free policy tests
+        run: python scripts/check_project.py
+      - name: Prepare Android ONNX Runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          ort_dir="$RUNNER_TEMP/ultron-ort-1.23.2"
+          ort_url="https://repo.maven.apache.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.23.2/onnxruntime-android-1.23.2.aar"
+          mkdir -p "$ort_dir"
+          curl -fsSL --retry 3 "$ort_url" -o "$ort_dir/runtime.aar"
+          curl -fsSL --retry 3 "$ort_url.sha1" -o "$ort_dir/runtime.sha1"
+          python -c 'import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); expected=(p/"runtime.sha1").read_text().split()[0].lower(); actual=hashlib.sha1((p/"runtime.aar").read_bytes()).hexdigest(); assert actual==expected, "ONNX Runtime integrity mismatch"' "$ort_dir"
+          unzip -q "$ort_dir/runtime.aar" 'headers/*' 'jni/arm64-v8a/libonnxruntime.so' -d "$ort_dir"
+          test -f "$ort_dir/headers/onnxruntime_cxx_api.h"
+          test -f "$ort_dir/jni/arm64-v8a/libonnxruntime.so"
+          readelf -h "$ort_dir/jni/arm64-v8a/libonnxruntime.so" | grep -q 'AArch64'
+          echo "SHERPA_ONNXRUNTIME_INCLUDE_DIR=$ort_dir/headers" >> "$GITHUB_ENV"
+          echo "SHERPA_ONNXRUNTIME_LIB_DIR=$ort_dir/jni/arm64-v8a" >> "$GITHUB_ENV"
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 8.13 --distribution-type bin
+      - name: Build and lint ARM64 APK
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+      - name: Verify APK alignment and signature
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          python scripts/check_elf.py app/build/outputs/apk/debug/app-debug.apk
+          sha256sum app/build/outputs/apk/debug/app-debug.apk > app/build/outputs/apk/debug/SHA256SUMS
+      - name: Package exact source and locks
+        run: python scripts/package_source.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ULTRON-arm64-development
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/SHA256SUMS
+            ULTRON-source.zip
+            dependencies.lock.json
+            wake-release.lock.json
+            app/src/main/assets/models.lock.json
+            app/build/reports/lint-results-debug.html
+            app/build/reports/tests/testDebugUnitTest/
+          retention-days: 30
